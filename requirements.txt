@@ -1,5 +1,7 @@
 streamlit
 google-generativeai
+requests
+beautifulsoup4
 PyPDF2
 pandas
 plotly
