@@ -6,10 +6,12 @@ import streamlit as st
 import plotly.express as px
 from bs4 import BeautifulSoup
 import PyPDF2
-import google.generativeai as genai
-
-# Desabilita avisos de certificado SSL do requests caso ocorra em ambiente de nuvem
 import urllib3
+
+# SDK Atualizado do Google GenAI
+from google import genai
+from google.genai import types
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # -----------------------------------------------------------------------------
@@ -31,11 +33,9 @@ st.sidebar.header("⚙️ Configurações do Sistema")
 
 api_key = ""
 
-# Lê a chave do Secrets limpando espaços em branco acidentais e aspas
 if "GEMINI_API_KEY" in st.secrets:
     api_key = str(st.secrets["GEMINI_API_KEY"]).strip().strip('"').strip("'")
-    
-# Se a chave do Secrets for inválida ou não existir, dá a opção de input manual
+
 if not api_key or len(api_key) < 20:
     api_key = st.sidebar.text_input("Insira sua Google Gemini API Key:", type="password").strip()
 else:
@@ -49,14 +49,14 @@ kw_search = st.sidebar.text_input("Palavra-chave para busca no portal:", value="
 max_editions = st.sidebar.slider("Quantidade máxima de PDFs para baixar/analisar:", min_value=1, max_value=10, value=2)
 
 if not api_key:
-    st.info("💡 Por favor, verifique sua API Key no Google AI Studio e atualize nos Secrets do Streamlit Cloud.")
+    st.info("💡 Por favor, verifique sua API Key e configure nos Secrets do Streamlit Cloud ou na barra lateral.")
     st.stop()
 
-# Configuração global da biblioteca
-genai.configure(api_key=api_key)
+# Instancia o cliente do SDK oficial atualizado
+client = genai.Client(api_key=api_key)
 
 # -----------------------------------------------------------------------------
-# 3. SCRAPING E DOWNLOAD
+# 3. SCRAPING MELHORADO PARA LINKS DIRETOS DE PDF
 # -----------------------------------------------------------------------------
 def fetch_diario_oficial_links(keyword: str, limit: int) -> list:
     headers = {
@@ -75,10 +75,15 @@ def fetch_diario_oficial_links(keyword: str, limit: int) -> list:
         
         for a in links:
             href = a['href']
-            if ".pdf" in href.lower() or "/download/" in href.lower() or "diario" in href.lower():
+            # Filtra links que de fato levam ao arquivo de download
+            if "download" in href.lower() or ".pdf" in href.lower() or "/ver/" in href.lower():
                 full_url = href if href.startswith("http") else f"https://www.valinhos.sp.gov.br{href}"
                 title = a.get_text(strip=True) or "Edição Diário Oficial"
                 
+                # Trata URLs que abrem a página interna para tentar converter no endpoint direto de download
+                if "/ver/" in full_url and "download" not in full_url:
+                    full_url = full_url.replace("/ver/", "/download/")
+
                 if not any(item['url'] == full_url for item in found_pdfs):
                     found_pdfs.append({"titulo": title, "url": full_url})
                 
@@ -98,13 +103,12 @@ def download_and_validate_pdf(url: str, output_path: str) -> bool:
         response = requests.get(url, headers=headers, timeout=30, verify=False, allow_redirects=True)
         if response.status_code == 200:
             content = response.content
-            # Aceita arquivos iniciados em %PDF
             if content.startswith(b'%PDF'):
                 with open(output_path, "wb") as f:
                     f.write(content)
                 return True
             else:
-                st.warning("O link do portal redirecionou para HTML ao invés de baixar o arquivo PDF bruto.")
+                st.warning("O link do portal redirecionou para uma página HTML em vez de entregar o PDF bruto.")
                 return False
     except Exception as e:
         st.error(f"Erro no download: {e}")
@@ -123,17 +127,17 @@ def extract_text_from_pdf(file_path: str) -> str:
     return text
 
 # -----------------------------------------------------------------------------
-# 4. ANALISADOR INTELIGENTE (GEMINI)
+# 4. ANALISADOR INTELIGENTE (GOOGLE GENAI SDK - GEMINI 2.5 FLASH)
 # -----------------------------------------------------------------------------
 def analyze_with_gemini(text_content: str, source_name: str) -> dict:
     prompt = f"""
     Você é um auditor sênior do Tribunal de Contas do Estado de São Paulo (TCE-SP).
-    Analise o texto abaixo do Diário Oficial de Valinhos procurando por extratos de contratos, dispensas e aditivos.
+    Analise o texto abaixo do Diário Oficial de Valinhos procurando por extratos de contratos, dispensas de licitação e aditivos.
 
     Texto:
     {text_content[:20000]}
 
-    Retorne APENAS um JSON estrito nesta estrutura:
+    Retorne APENAS um JSON estrito com esta estrutura exata:
     {{
       "documento_fonte": "{source_name}",
       "empresa_principal": "Nome da empresa ou N/A",
@@ -141,30 +145,26 @@ def analyze_with_gemini(text_content: str, source_name: str) -> dict:
       "valor_total_identificado": 0.00,
       "score_risco": 0,
       "classificacao_risco": "Baixo | Médio | Alto | Crítico",
-      "alertas_inconformidades": ["Alerta 1"],
-      "resumo_extratos": "Resumo rápido"
+      "alertas_inconformidades": ["Descrição do alerta"],
+      "resumo_extratos": "Resumo dos atos oficiais"
     }}
     """
     
-    # Testa os modelos compatíveis
-    models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"]
-    
-    for m_name in models_to_try:
-        try:
-            model = genai.GenerativeModel(m_name)
-            response = model.generate_content(
-                prompt,
-                generation_config={"response_mime_type": "application/json"}
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
             )
-            return json.loads(response.text)
-        except Exception:
-            continue
-            
-    st.error("Falha ao comunicar com os modelos da API do Gemini. Verifique a chave configurada.")
-    return {}
+        )
+        return json.loads(response.text)
+    except Exception as e:
+        st.error(f"Erro na chamada do Gemini ({source_name}): {e}")
+        return {}
 
 # -----------------------------------------------------------------------------
-# 5. EXECUÇÃO
+# 5. EXECUÇÃO DA INTERFACE
 # -----------------------------------------------------------------------------
 st.subheader("1. Iniciar Varredura do Portal Oficial")
 
